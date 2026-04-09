@@ -9,7 +9,7 @@ COPY . .
 
 EXPOSE 3200
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget -qO- http://localhost:3200/health || exit 1
+HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --retries=5 \
+  CMD wget -qO- http://127.0.0.1:3200/health || exit 1
 
 CMD ["node", "server.js"]

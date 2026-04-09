@@ -8,10 +8,14 @@ const PORT = parseInt(process.env.PORT || '3200')
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
-// Health check
-app.get('/health', async (req, res) => {
+// Health check (lightweight — doesn't require MongoDB to be up)
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() })
+})
+
+// Deep health check (includes MongoDB connectivity)
+app.get('/health/deep', async (req, res) => {
   try {
-    // Lazy import to avoid circular — just check we can reach MongoDB
     const { getDb } = await import('./db.js')
     const db = await getDb()
     const stats = await db.command({ ping: 1 })
