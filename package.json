@@ -1,0 +1,15 @@
+{
+  "name": "pies",
+  "version": "1.0.0",
+  "description": "PIES Knowledge Graph — Standalone Service",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.1.0",
+    "mongodb": "^6.16.0"
+  }
+}

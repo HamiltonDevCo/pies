@@ -1,0 +1,30 @@
+services:
+  pies:
+    build: .
+    container_name: pies-api
+    restart: unless-stopped
+    ports:
+      - "3200:3200"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/pies?directConnection=true
+      - PIES_SYNC_TOKEN=${PIES_SYNC_TOKEN}
+      - PORT=3200
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7
+    container_name: pies-mongo
+    restart: unless-stopped
+    volumes:
+      - pies-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  pies-mongo-data:
