@@ -6,7 +6,7 @@ const app = express()
 const PORT = parseInt(process.env.PORT || '3200')
 
 app.use(cors())
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: '50mb' }))
 
 // Health check (lightweight — doesn't require MongoDB to be up)
 app.get('/health', (req, res) => {
