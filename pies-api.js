@@ -456,6 +456,50 @@ router.get('/stats', async (req, res) => {
 })
 
 // -------------------------------------------------------------------
+// POST /import/bulk — Bulk import raw documents (for migration)
+// Accepts { collection: "people"|"interactions"|"relationships", documents: [...] }
+// -------------------------------------------------------------------
+
+router.post('/import/bulk', async (req, res) => {
+  try {
+    const db = await getDb()
+    const { collection, documents } = req.body
+    if (!collection || !Array.isArray(documents) || documents.length === 0) {
+      return res.status(400).json({ error: 'collection and documents[] required' })
+    }
+    if (!['people', 'interactions', 'relationships'].includes(collection)) {
+      return res.status(400).json({ error: 'collection must be people, interactions, or relationships' })
+    }
+
+    // Convert _id strings back to ObjectId and other ObjectId fields
+    const { ObjectId } = await import('mongodb')
+    const docs = documents.map(doc => {
+      const d = { ...doc }
+      if (d._id?.$oid) d._id = new ObjectId(d._id.$oid)
+      else if (typeof d._id === 'string' && d._id.length === 24) d._id = new ObjectId(d._id)
+      // Convert person_id, from, to fields
+      for (const field of ['person_id', 'from', 'to', 'company_id', 'reports_to']) {
+        if (d[field]?.$oid) d[field] = new ObjectId(d[field].$oid)
+        else if (typeof d[field] === 'string' && d[field].length === 24) d[field] = new ObjectId(d[field])
+      }
+      return d
+    })
+
+    // Use ordered:false for speed (continue on duplicate key errors)
+    const result = await db.collection(collection).insertMany(docs, { ordered: false }).catch(err => {
+      if (err.code === 11000) {
+        return { insertedCount: err.result?.insertedCount || 0, duplicates: err.writeErrors?.length || 0 }
+      }
+      throw err
+    })
+
+    res.json({ ok: true, inserted: result.insertedCount, duplicates: result.duplicates || 0 })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
 // POST /auto-tier — Run auto-tiering on all people
 // -------------------------------------------------------------------
 
