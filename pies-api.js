@@ -15,6 +15,10 @@
  *   POST /interaction/batch         — Batch log interactions (auth required)
  *   GET  /stats                     — Database stats
  *   POST /auto-tier                 — Run auto-tiering (auth required)
+ *   GET  /person/:id/profile        — Get behavioral profile
+ *   POST /person/:id/profile        — Generate/refresh behavioral profile (auth required)
+ *   GET  /profiles                  — List all profiled people
+ *   POST /profile/batch             — Batch profile top contacts (auth required)
  */
 
 import { Router } from 'express'
@@ -26,6 +30,7 @@ const require = createRequire(import.meta.url)
 const { resolveAndUpsert, resolveOnly, normalizePhone, normalizeEmail, jaroWinkler } = require('./lib/pies-resolve.cjs')
 const { addRelationship, getRelationships, getFamilyMembers, getPhoneTree, ensureIndexes } = require('./lib/pies-relationships.cjs')
 const { autoTierAll } = require('./lib/pies-auto-tier.cjs')
+const { runEnrichment } = require('./lib/pies-enrich.cjs')
 
 const router = Router()
 
@@ -152,6 +157,98 @@ router.get('/person', async (req, res) => {
 })
 
 // -------------------------------------------------------------------
+// GET /people — Paginated people list with filters
+// -------------------------------------------------------------------
+
+router.get('/people', async (req, res) => {
+  try {
+    const db = await getDb()
+    const people = db.collection('people')
+    const page = Math.max(1, parseInt(req.query.page || '1'))
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '50')))
+    const skip = (page - 1) * limit
+
+    const filter = {}
+    if (req.query.tier) filter.tier = req.query.tier
+    if (req.query.entity_type) filter.entity_type = req.query.entity_type
+    if (req.query.q) filter.name = { $regex: req.query.q, $options: 'i' }
+    if (req.query.has_profile === 'true') filter.behavioral_profile = { $exists: true }
+    if (req.query.has_profile === 'false') filter.behavioral_profile = { $exists: false }
+    if (req.query.family_type) filter.family_type = req.query.family_type
+    if (req.query.living_status) filter.living_status = req.query.living_status
+
+    // Sort
+    const sortField = req.query.sort || '-interaction_count'
+    const sortDir = sortField.startsWith('-') ? -1 : 1
+    const sortKey = sortField.replace(/^-/, '')
+    const sort = { [sortKey]: sortDir }
+
+    const [docs, total] = await Promise.all([
+      people.find(filter).sort(sort).skip(skip).limit(limit).toArray(),
+      people.countDocuments(filter),
+    ])
+
+    res.json({
+      people: docs,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      limit,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// PUT /person/:id — Update person fields
+// -------------------------------------------------------------------
+
+router.put('/person/:id', async (req, res) => {
+  try {
+    const db = await getDb()
+    const id = new ObjectId(req.params.id)
+    const updates = { ...req.body }
+    delete updates._id // never overwrite _id
+    updates.updated_at = new Date()
+
+    const result = await db.collection('people').findOneAndUpdate(
+      { _id: id },
+      { $set: updates },
+      { returnDocument: 'after' }
+    )
+    if (!result) return res.status(404).json({ error: 'Person not found' })
+    res.json(result)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// PUT /relationship/:id — Update relationship fields
+// -------------------------------------------------------------------
+
+router.put('/relationship/:id', async (req, res) => {
+  try {
+    const db = await getDb()
+    const id = new ObjectId(req.params.id)
+    const updates = { ...req.body }
+    delete updates._id
+    updates.updated_at = new Date()
+
+    const result = await db.collection('relationships').findOneAndUpdate(
+      { _id: id },
+      { $set: updates },
+      { returnDocument: 'after' }
+    )
+    if (!result) return res.status(404).json({ error: 'Relationship not found' })
+    res.json(result)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
 // GET /person/:id
 // -------------------------------------------------------------------
 
@@ -199,21 +296,66 @@ router.get('/person/:id/context', async (req, res) => {
 
     if (!person) return res.status(404).json({ error: 'Person not found' })
 
+    // Enrich relationships with the other person's data
+    const enrichedRels = await Promise.all(relationships.map(async r => {
+      const otherId = r.to?.toString() === id.toString() ? r.from : r.to
+      let other_person = null
+      if (otherId) {
+        try {
+          other_person = await db.collection('people').findOne(
+            { _id: new ObjectId(otherId) },
+            { projection: { name: 1, tier: 1, family_type: 1, living_status: 1 } }
+          )
+        } catch {}
+      }
+      return { ...r, other_person }
+    }))
+
     res.json({
       person,
-      relationships: relationships.map(r => ({
-        type: r.type, role: r.role, strength: r.strength,
-        name: r.person?.name,
-        phone: r.person?.phones?.[0]?.number || r.person?.identities?.phones?.[0],
-      })),
-      recent_interactions: recentInteractions,
-      summary: {
-        relationship_count: relationships.length,
-        interaction_count: person.interaction_count || recentInteractions.length,
-        tier: person.tier,
-        last_interaction: person.last_interaction,
-      },
+      relationships: enrichedRels,
+      interactions: recentInteractions,
     })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// GET /churn-alerts — Top churn risk contacts
+// -------------------------------------------------------------------
+
+router.get('/churn-alerts', async (req, res) => {
+  try {
+    const db = await getDb()
+    const limit = parseInt(req.query.limit || '20')
+
+    const alerts = await db.collection('relationships').find({
+      churn_risk: { $exists: true, $gt: 0.3 },
+      relationship_type: { $ne: 'spam' },
+    })
+    .sort({ churn_risk: -1 })
+    .limit(limit)
+    .toArray()
+
+    // Enrich with person names
+    const enriched = await Promise.all(alerts.map(async a => {
+      const person = await db.collection('people').findOne(
+        { _id: a.to },
+        { projection: { name: 1, tier: 1 } }
+      )
+      return {
+        _id: a.to?.toString(),
+        name: person?.name || 'Unknown',
+        churn_risk: a.churn_risk,
+        days_silent: a.days_silent || 0,
+        reason: a.churn_reason || 'silent',
+        tie_strength: a.tie_strength || 0,
+        dunbar_layer: a.dunbar_layer || 'unknown',
+      }
+    }))
+
+    res.json(enriched)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -230,15 +372,14 @@ router.get('/family', async (req, res) => {
     if (!justinId) return res.status(404).json({ error: 'Justin (Self) record not found' })
 
     const family = await getFamilyMembers(db, justinId)
-    res.json({
-      family: family.map(f => ({
-        name: f.person?.name, role: f.role,
-        phone: f.person?.phones?.[0]?.number || f.person?.identities?.phones?.[0],
-        strength: f.strength, person_id: f.to?.toString(),
-        phone_tree_order: f.phone_tree_order,
-      })),
-      count: family.length,
-    })
+
+    // Return full person objects for the family view
+    const personIds = family.map(f => f.to).filter(Boolean)
+    const people = await db.collection('people').find({
+      _id: { $in: personIds }
+    }).toArray()
+
+    res.json(people)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -427,6 +568,132 @@ router.post('/interaction/batch', async (req, res) => {
 })
 
 // -------------------------------------------------------------------
+// GET /interactions — Bulk list interactions across all people
+// -------------------------------------------------------------------
+
+router.get('/interactions', async (req, res) => {
+  try {
+    const db = await getDb()
+    const page = Math.max(1, parseInt(req.query.page) || 1)
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50))
+    const skip = (page - 1) * limit
+
+    const filter = {}
+    if (req.query.channel) filter.channel = req.query.channel
+    if (req.query.direction) filter.direction = req.query.direction
+    if (req.query.person_id) {
+      filter.person_id = new ObjectId(req.query.person_id)
+    }
+    if (req.query.since) {
+      filter.timestamp = { $gte: new Date(req.query.since) }
+    }
+
+    const [interactions, total] = await Promise.all([
+      db.collection('interactions')
+        .find(filter)
+        .sort({ timestamp: -1 })
+        .skip(skip)
+        .limit(limit)
+        .toArray(),
+      db.collection('interactions').countDocuments(filter),
+    ])
+
+    // Gather channel counts for filter UI
+    const channelAgg = await db.collection('interactions').aggregate([
+      { $group: { _id: '$channel', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+    ]).toArray()
+    const channels = channelAgg.map(c => ({ channel: c._id, count: c.count }))
+
+    res.json({
+      interactions,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+      channels,
+    })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// GET /graph — Relationship graph data for visualization
+// -------------------------------------------------------------------
+
+router.get('/graph', async (req, res) => {
+  try {
+    const db = await getDb()
+
+    // Get all relationships with enriched person data
+    const relationships = await db.collection('relationships').find({}).toArray()
+
+    // Collect all person IDs referenced
+    const personIds = new Set()
+    for (const r of relationships) {
+      if (r.from) personIds.add(r.from.toString())
+      if (r.to) personIds.add(r.to.toString())
+    }
+
+    // Fetch all referenced people
+    const people = await db.collection('people').find({
+      _id: { $in: [...personIds].map(id => {
+        try { return new ObjectId(id) } catch { return id }
+      }) }
+    }, {
+      projection: { name: 1, tier: 1, entity_type: 1, interaction_count: 1, family_type: 1 }
+    }).toArray()
+
+    const peopleMap = {}
+    for (const p of people) {
+      peopleMap[p._id.toString()] = p
+    }
+
+    // Build nodes and edges for visualization
+    const nodes = people.map(p => ({
+      id: p._id.toString(),
+      name: p.name,
+      tier: p.tier,
+      entity_type: p.entity_type,
+      interaction_count: p.interaction_count || 0,
+      family_type: p.family_type,
+    }))
+
+    const edges = relationships.map(r => ({
+      id: r._id.toString(),
+      source: r.from?.toString(),
+      target: r.to?.toString(),
+      type: r.type || r.relationship_type,
+      tie_strength: r.tie_strength,
+      dunbar_layer: r.dunbar_layer,
+      momentum: r.momentum,
+      community_id: r.community_id,
+      churn_risk: r.churn_risk,
+      source_name: peopleMap[r.from?.toString()]?.name,
+      target_name: peopleMap[r.to?.toString()]?.name,
+    }))
+
+    // Community summary
+    const communities = {}
+    for (const r of relationships) {
+      if (r.community_id != null) {
+        if (!communities[r.community_id]) communities[r.community_id] = { id: r.community_id, members: new Set() }
+        if (r.from) communities[r.community_id].members.add(r.from.toString())
+        if (r.to) communities[r.community_id].members.add(r.to.toString())
+      }
+    }
+    const communitySummary = Object.values(communities).map(c => ({
+      id: c.id,
+      size: c.members.size,
+    }))
+
+    res.json({ nodes, edges, communities: communitySummary })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
 // GET /stats
 // -------------------------------------------------------------------
 
@@ -507,6 +774,92 @@ router.post('/auto-tier', async (req, res) => {
   try {
     const db = await getDb()
     const stats = await autoTierAll(db)
+    res.json({ ok: true, ...stats })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// GET /person/:id/profile — Get behavioral profile
+// -------------------------------------------------------------------
+
+router.get('/person/:id/profile', async (req, res) => {
+  try {
+    const db = await getDb()
+    const person = await db.collection('people').findOne({ _id: new ObjectId(req.params.id) })
+    if (!person) return res.status(404).json({ error: 'Person not found' })
+    if (!person.behavioral_profile) return res.status(404).json({ error: 'No profile generated yet', person_name: person.name })
+    res.json({ person_name: person.name, profile: person.behavioral_profile })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// POST /person/:id/profile — Generate/refresh behavioral profile
+// -------------------------------------------------------------------
+
+router.post('/person/:id/profile', async (req, res) => {
+  try {
+    const db = await getDb()
+    const { profilePerson } = require('./lib/pies-profiler.cjs')
+    const result = await profilePerson(db, req.params.id)
+    if (result.error) return res.status(400).json(result)
+    res.json(result)
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// GET /profiles — List all profiled people
+// -------------------------------------------------------------------
+
+router.get('/profiles', async (req, res) => {
+  try {
+    const db = await getDb()
+    const limit = parseInt(req.query.limit || '50')
+    const profiled = await db.collection('people').find(
+      { behavioral_profile: { $exists: true } },
+      { projection: { name: 1, tier: 1, interaction_count: 1, last_profiled: 1, 'behavioral_profile.behavioral.relationship_dynamic': 1, 'behavioral_profile.behavioral.communication_style': 1, 'behavioral_profile.quantitative.engagement_trend': 1 } }
+    ).sort({ interaction_count: -1 }).limit(limit).toArray()
+
+    res.json({ count: profiled.length, profiles: profiled })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// POST /profile/batch — Batch profile top contacts
+// -------------------------------------------------------------------
+
+router.post('/profile/batch', async (req, res) => {
+  try {
+    const db = await getDb()
+    const { profileTopContacts } = require('./lib/pies-profiler.cjs')
+    const options = {
+      minInteractions: req.body.minInteractions || 20,
+      limit: req.body.limit || 50,
+      forceRefresh: req.body.forceRefresh || false,
+    }
+    const results = await profileTopContacts(db, options)
+    res.json({ ok: true, ...results })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// -------------------------------------------------------------------
+// POST /enrich — Run enrichment pipeline
+// -------------------------------------------------------------------
+
+router.post('/enrich', async (req, res) => {
+  try {
+    const db = await getDb()
+    const justinId = req.body.justinId ? new ObjectId(req.body.justinId) : null
+    const stats = await runEnrichment(db, { justinId })
     res.json({ ok: true, ...stats })
   } catch (err) {
     res.status(500).json({ error: err.message })
